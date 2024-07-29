@@ -1,0 +1,16 @@
+# config.yaml
+
+network:
+   device: wlan0
+   ssid: MEO-WiFi
+   retry:
+      interval: 5
+      attempts: 6
+
+meowifi:
+   url: https://wifimeo.meo.pt/en
+   username: foobar@gmail.com
+   password: changemenow
+
+chromedriver:
+   path: /usr/bin/chromedriver
