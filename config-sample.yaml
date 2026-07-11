@@ -6,11 +6,28 @@ network:
    retry:
       interval: 5
       attempts: 6
+   # After a failed MEO login, stay on the fallback this long before retrying
+   # MEO again (avoids dropping the hotspot's internet every scheduled run).
+   meo_retry_backoff_minutes: 30
+   fallback:
+      connection: my-home-wifi   # nmcli connection to use if MEO login fails
+
+hotspot:
+   connection: MONGE-PI  # nmcli connection name for the wlan1 AP (mode=ap, ipv4.method=shared)
+   psk: changemenow      # AP password; used only by setup-hotspot.sh to recreate the AP
 
 meowifi:
-   url: https://wifimeo.meo.pt/en
+   # The MEO WiFi captive portal (redirects to the WebSSO email/password login).
+   portal_url: https://meowifi.meo.pt/
    username: foobar@gmail.com
    password: changemenow
 
 chromedriver:
    path: /usr/bin/chromedriver
+
+browser:
+   binary: /usr/bin/chromium
+   headless: false           # headful passes hCaptcha silently; needs DISPLAY
+   # Persistent profile shared with seed_profile.sh. Seed it once by logging in
+   # by hand (solving any captcha), then runs reuse that MEO session.
+   profile_dir: chrome-profile

@@ -1,0 +1,8 @@
+config.yaml
+__pycache__/
+*.pyc
+.venv/
+venv/
+debug/
+chrome-profile/
+.meo_backoff
