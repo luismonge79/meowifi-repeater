@@ -404,6 +404,11 @@ def login_meo_wifi():
 
 BACKOFF_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.meo_backoff')
 
+def _boot_time():
+    """Epoch seconds when the system last booted."""
+    with open('/proc/uptime') as f:
+        return time.time() - float(f.read().split()[0])
+
 def meo_in_backoff():
     """True while a recent MEO login failure should keep us on the fallback.
 
@@ -411,8 +416,15 @@ def meo_in_backoff():
     re-test the login — dropping the hotspot's internet each time if MEO keeps
     demanding a login we can't complete (e.g. the captcha). The back-off lets us
     ride the fallback quietly until it's worth trying MEO again.
+
+    A reboot is a clean retry point: whatever transient thing broke the login is
+    gone, so a back-off written before this boot is stale and must be ignored,
+    otherwise the Pi comes up on the fallback and never tries MEO on its own.
     """
     try:
+        if os.path.getmtime(BACKOFF_FILE) < _boot_time():
+            clear_meo_backoff()
+            return False
         with open(BACKOFF_FILE) as f:
             return time.time() < float(f.read().strip())
     except (OSError, ValueError):
