@@ -233,6 +233,50 @@ def js_click(driver, element):
     driver.execute_script(
         "arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", element)
 
+def captcha_present(driver):
+    """True if a *visible* bot-challenge (hCaptcha/reCAPTCHA) is on the page.
+
+    When the saved MEO session has expired, the WebSSO login raises a challenge
+    we can't solve unattended. Detecting it lets us stop retrying and emit a
+    clear 're-seed needed' signal instead of burning attempts against a wall.
+    An invisible/passive hCaptcha (the kind that passes silently) is not
+    displayed, so it won't trip this.
+    """
+    selectors = ('iframe[src*="hcaptcha"]', 'iframe[src*="recaptcha"]',
+                 '.h-captcha', '.g-recaptcha')
+    for sel in selectors:
+        for el in driver.find_elements(By.CSS_SELECTOR, sel):
+            try:
+                if el.is_displayed():
+                    return True
+            except Exception:
+                pass
+    return False
+
+def tick_remember_me(driver):
+    """Best-effort tick of a 'keep me signed in' checkbox on the WebSSO page.
+
+    A remembered session lasts longer, so the repeater re-logs-in less often
+    (and, when it does, is likelier to sail through without a captcha). The
+    box's id/name varies between portal versions and may be absent entirely, so
+    match a remember/save checkbox and quietly do nothing if there isn't one.
+    """
+    locators = [
+        (By.ID, 'save_credentials'),                          # pre-2026 portal
+        (By.CSS_SELECTOR, 'input[type="checkbox"][id*="emember"]'),
+        (By.CSS_SELECTOR, 'input[type="checkbox"][name*="emember"]'),
+        (By.CSS_SELECTOR, 'input[type="checkbox"][id*="ave"]'),
+    ]
+    for by, value in locators:
+        for box in driver.find_elements(by, value):
+            try:
+                if not box.is_selected():
+                    js_click(driver, box)
+                    logging.info(f"Ticked 'keep me signed in' ({value}).")
+                return
+            except Exception:
+                pass
+
 def dump_debug_artifacts(driver, tag):
     """Save a screenshot and page source so a failed login can be diagnosed later."""
     try:
@@ -293,9 +337,7 @@ def login_meo_wifi():
         portal_url = (config['meowifi'].get('portal_url')
                       or config['meowifi'].get('probe_url')
                       or 'https://meowifi.meo.pt/')
-        driver.get(portal_url)
-        time.sleep(8)  # let the SPA render (page load never "completes")
-        logging.info(f"Portal landed on: {driver.current_url!r} (title: {driver.title!r})")
+        max_attempts = config['meowifi'].get('login_attempts', 3)
 
         # The real login form is the WebSSO page, not the Angular portal's own
         # voucher/recover fields (those look like a login form but aren't).
@@ -306,94 +348,125 @@ def login_meo_wifi():
             (By.CSS_SELECTOR, 'input[type="email"]'),
         ]
 
-        # Walk the portal wizard until the WebSSO login form appears: dismiss the
-        # ad if present, tick the terms checkbox (via its label — the input is
-        # style-hidden, so clicking it directly does nothing), then click the
-        # Continue button, which becomes enabled once terms are accepted.
-        deadline = time.time() + 60
-        username_field = None
-        while time.time() < deadline:
-            # A saved session may auto-authenticate after "Continue" without ever
-            # showing the login form — if we're already online, we're done.
-            if check_internet_connection():
-                logging.info("Already authenticated via saved session; internet is up.")
+        # The portal SPA sometimes never renders past its loading spinner (the
+        # `no-login-form` failures), and a submitted login can also fail to bring
+        # the session up. Both usually clear on a fresh navigation, so drive the
+        # whole flow in a retry loop and only give up (handing back to the
+        # caller's back-off) once every attempt has failed. A genuine captcha is
+        # the exception: it can't be solved unattended, so we bail immediately.
+        for attempt in range(1, max_attempts + 1):
+            logging.info(f"MEO-WiFi login attempt {attempt}/{max_attempts}.")
+            driver.get(portal_url)
+            time.sleep(8)  # let the SPA render (page load never "completes")
+            logging.info(f"Portal landed on: {driver.current_url!r} (title: {driver.title!r})")
+
+            # Walk the portal wizard until the WebSSO login form appears: dismiss
+            # the ad if present, tick the terms checkbox (via its label — the
+            # input is style-hidden, so clicking it directly does nothing), then
+            # click Continue, which becomes enabled once terms are accepted.
+            deadline = time.time() + 60
+            username_field = None
+            while time.time() < deadline:
+                # A saved session may auto-authenticate after "Continue" without
+                # ever showing the login form — if we're already online, done.
+                if check_internet_connection():
+                    logging.info("Already authenticated via saved session; internet is up.")
+                    return
+                username_field = find_first(driver, username_locators, "login username field")
+                if username_field is not None:
+                    break
+                for btn in driver.find_elements(By.CSS_SELECTOR, 'button.skip-button'):
+                    try:
+                        if btn.is_displayed() and btn.is_enabled():
+                            js_click(driver, btn)
+                            logging.info("Closed ad interstitial.")
+                            break
+                    except Exception:
+                        pass
+                for label in driver.find_elements(By.CSS_SELECTOR, 'label[for*="CheckboxTerms"]'):
+                    try:
+                        if not label.is_displayed():
+                            continue
+                        boxes = driver.find_elements(By.ID, label.get_attribute('for'))
+                        if boxes and not boxes[0].is_selected():
+                            js_click(driver, label)
+                            logging.info(f"Accepted terms ({label.get_attribute('for')}).")
+                    except Exception:
+                        pass
+                for btn in driver.find_elements(By.CSS_SELECTOR, 'button'):
+                    try:
+                        text = (btn.text or '').strip().lower()
+                        if (btn.is_displayed() and btn.is_enabled()
+                                and text in ('continue', 'continuar', 'connect')):
+                            js_click(driver, btn)
+                            logging.info(f"Clicked proceed button: {text!r}")
+                            break
+                    except Exception:
+                        pass
+                time.sleep(2)
+
+            if username_field is None:
+                # A real captcha is unrecoverable without a human: stop retrying
+                # and flag it loudly (this is the re-seed signal). Otherwise it's
+                # the transient spinner — reload and try again.
+                if captcha_present(driver):
+                    dump_debug_artifacts(driver, 'captcha-required')
+                    logging.error("CAPTCHA REQUIRED: a bot-challenge is blocking login; the "
+                                  "saved session has expired. Re-seed with ./seed_profile.sh.")
+                    return
+                dump_debug_artifacts(driver, 'no-login-form')
+                logging.warning(f"WebSSO login form never appeared (attempt "
+                                f"{attempt}/{max_attempts}); reloading the portal.")
+                continue
+
+            password_field = wait_for_first(driver, [
+                (By.ID, 'ContentPlaceHolder1_LoginTemplate_Template_WebSSOPasswordTextBox'),
+                (By.CSS_SELECTOR, 'input[name$="WebSSOPasswordTextBox"]'),
+                (By.ID, 'password'),
+                (By.CSS_SELECTOR, 'input[type="password"]'),
+            ], "password field")
+            if password_field is None:
+                dump_debug_artifacts(driver, 'missing-fields')
+                continue
+
+            # The form is up; a challenge here is equally unrecoverable unattended.
+            if captcha_present(driver):
+                dump_debug_artifacts(driver, 'captcha-required')
+                logging.error("CAPTCHA REQUIRED: a bot-challenge is on the login form; the "
+                              "saved session has expired. Re-seed with ./seed_profile.sh.")
                 return
-            username_field = find_first(driver, username_locators, "login username field")
-            if username_field is not None:
-                break
-            for btn in driver.find_elements(By.CSS_SELECTOR, 'button.skip-button'):
-                try:
-                    if btn.is_displayed() and btn.is_enabled():
-                        js_click(driver, btn)
-                        logging.info("Closed ad interstitial.")
-                        break
-                except Exception:
-                    pass
-            for label in driver.find_elements(By.CSS_SELECTOR, 'label[for*="CheckboxTerms"]'):
-                try:
-                    if not label.is_displayed():
-                        continue
-                    boxes = driver.find_elements(By.ID, label.get_attribute('for'))
-                    if boxes and not boxes[0].is_selected():
-                        js_click(driver, label)
-                        logging.info(f"Accepted terms ({label.get_attribute('for')}).")
-                except Exception:
-                    pass
-            for btn in driver.find_elements(By.CSS_SELECTOR, 'button'):
-                try:
-                    text = (btn.text or '').strip().lower()
-                    if (btn.is_displayed() and btn.is_enabled()
-                            and text in ('continue', 'continuar', 'connect')):
-                        js_click(driver, btn)
-                        logging.info(f"Clicked proceed button: {text!r}")
-                        break
-                except Exception:
-                    pass
-            time.sleep(2)
-        if username_field is None:
-            dump_debug_artifacts(driver, 'no-login-form')
-            logging.error("WebSSO login form never appeared. Either the portal did not "
-                          "intercept us (already logged in?) or the flow changed.")
-            return
 
-        password_field = wait_for_first(driver, [
-            (By.ID, 'ContentPlaceHolder1_LoginTemplate_Template_WebSSOPasswordTextBox'),
-            (By.CSS_SELECTOR, 'input[name$="WebSSOPasswordTextBox"]'),
-            (By.ID, 'password'),
-            (By.CSS_SELECTOR, 'input[type="password"]'),
-        ], "password field")
-        if password_field is None:
-            dump_debug_artifacts(driver, 'missing-fields')
-            return
+            username_field.send_keys(config['meowifi']['username'])
+            password_field.send_keys(config['meowifi']['password'])
+            tick_remember_me(driver)
 
-        username_field.send_keys(config['meowifi']['username'])
-        password_field.send_keys(config['meowifi']['password'])
+            # Click the WebSSO "Entrar" submit button (falls back to submitting
+            # the form directly). The terms checkbox lives on the earlier portal
+            # step, so there's nothing to tick here.
+            submit_button = wait_for_first(driver, [
+                (By.ID, 'ContentPlaceHolder1_LoginTemplate_Template_WebSSOSubmitButton'),
+                (By.CSS_SELECTOR, 'button[name="SubmitButton"]'),
+                (By.CSS_SELECTOR, 'button[type="submit"]'),
+                (By.CSS_SELECTOR, 'input[type="submit"]'),
+            ], "submit button", timeout=15)
+            if submit_button is not None:
+                js_click(driver, submit_button)
+            else:
+                logging.warning("No enabled submit button found; submitting the form directly.")
+                password_field.submit()
 
-        # Click the WebSSO "Entrar" submit button (falls back to submitting the
-        # form directly). The terms checkbox lives on the earlier portal step,
-        # so there's nothing to tick here.
-        submit_button = wait_for_first(driver, [
-            (By.ID, 'ContentPlaceHolder1_LoginTemplate_Template_WebSSOSubmitButton'),
-            (By.CSS_SELECTOR, 'button[name="SubmitButton"]'),
-            (By.CSS_SELECTOR, 'button[type="submit"]'),
-            (By.CSS_SELECTOR, 'input[type="submit"]'),
-        ], "submit button", timeout=15)
-        if submit_button is not None:
-            js_click(driver, submit_button)
-        else:
-            logging.warning("No enabled submit button found; submitting the form directly.")
-            password_field.submit()
-
-        # Poll for real internet access instead of blindly sleeping,
-        # so we know whether the login actually worked.
-        for _ in range(10):
-            time.sleep(2)
-            if check_internet_connection():
-                logging.info("Internet access confirmed after login.")
-                break
-        else:
+            # Poll for real internet access instead of blindly sleeping, so we
+            # know whether the login actually worked.
+            for _ in range(10):
+                time.sleep(2)
+                if check_internet_connection():
+                    logging.info("Internet access confirmed after login.")
+                    return
             dump_debug_artifacts(driver, 'login-not-confirmed')
-            logging.error("Login submitted but internet access was not confirmed.")
+            logging.warning(f"Login submitted but internet not confirmed (attempt "
+                            f"{attempt}/{max_attempts}).")
+
+        logging.error(f"MEO-WiFi login failed after {max_attempts} attempts.")
     except Exception as e:
         logging.error(f"Error during login: {e}")
         if driver is not None:

@@ -19,6 +19,10 @@ hotspot:
 meowifi:
    # The MEO WiFi captive portal (redirects to the WebSSO email/password login).
    portal_url: https://meowifi.meo.pt/
+   # Reloads of the portal + login retries within one run before giving up to
+   # the fallback. A spinning/blank portal usually clears on a fresh reload, so
+   # retrying beats dropping to a 30-min back-off. A real captcha stops early.
+   login_attempts: 3
    username: foobar@gmail.com
    password: changemenow
 
