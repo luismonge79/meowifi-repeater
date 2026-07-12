@@ -6,3 +6,4 @@ venv/
 debug/
 chrome-profile/
 .meo_backoff
+.net_state

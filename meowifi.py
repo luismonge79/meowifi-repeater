@@ -6,14 +6,18 @@ import requests
 import subprocess
 import time
 import yaml
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 
 
-# Log to stderr (captured by systemd) and to a rotating file so the history
+# Log to stderr (captured by systemd) and to a daily-rotated file so the history
 # survives reboots and can be inspected with `tail -f debug/meowifi.log`.
+# Routine per-run "still fine" chatter is logged at DEBUG (below the INFO handler
+# level) so a healthy Pi writes almost nothing to the SD card; only state changes
+# — offline/online transitions, logins, errors — hit the file. backupCount=8
+# keeps ~8 days, so at least a week of history is always retained.
 _log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'debug')
 os.makedirs(_log_dir, exist_ok=True)
 logging.basicConfig(
@@ -21,8 +25,8 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(message)s',
     handlers=[
         logging.StreamHandler(),
-        RotatingFileHandler(os.path.join(_log_dir, 'meowifi.log'),
-                            maxBytes=512_000, backupCount=3),
+        TimedRotatingFileHandler(os.path.join(_log_dir, 'meowifi.log'),
+                                 when='midnight', backupCount=8),
     ],
 )
 
@@ -30,7 +34,7 @@ logging.basicConfig(
 with open('config.yaml', 'r') as file:
     config = yaml.safe_load(file)
 
-def check_internet_connection():
+def check_internet_connection(quiet=False):
     """Check for real internet access, not just an HTTP response.
 
     A captive portal (like MEO-WiFi's login page) answers any plain HTTP
@@ -44,7 +48,8 @@ def check_internet_connection():
         response = requests.get("http://connectivitycheck.gstatic.com/generate_204", timeout=5)
         return response.status_code == 204
     except requests.RequestException as e:
-        logging.error(f"Error connecting to the internet: {e}")
+        if not quiet:
+            logging.error(f"Error connecting to the internet: {e}")
         return False
 
 def is_connected():
@@ -192,7 +197,7 @@ def start_hotspot():
 
 def ensure_hotspot():
     if is_hotspot_active():
-        logging.info(f"Hotspot {config['hotspot']['connection']} already active.")
+        logging.debug(f"Hotspot {config['hotspot']['connection']} already active.")
     else:
         logging.error(f"Hotspot {config['hotspot']['connection']} is down. Starting it...")
         start_hotspot()
@@ -518,13 +523,66 @@ def clear_meo_backoff():
     except OSError:
         pass
 
-def main():
+NET_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.net_state')
+
+def _fmt_duration(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+def record_net_status():
+    """Log how long we were *completely* offline — no internet on any uplink.
+
+    "Completely offline" is exactly what the generate_204 probe measures: it's
+    False only when neither MEO-WiFi nor the fallback can reach the internet, so
+    the hotspot's clients are truly dark (a failed MEO login alone doesn't count,
+    because the fallback usually carries us).
+
+    Status is sampled once per run (~every 3 min), so a reported duration is
+    accurate to that granularity. The state file is rewritten *only* on a
+    transition, so a healthy Pi never touches the SD card for this. The window
+    is intentionally carried across reboots: from a client's view, a Pi that was
+    off or rebooting was offline for that whole stretch.
+    """
+    online = check_internet_connection(quiet=True)
+    now = time.time()
+    status = 'online' if online else 'offline'
+    try:
+        with open(NET_STATE_FILE) as f:
+            prev_status, prev_since = f.read().split()
+            prev_since = float(prev_since)
+    except (OSError, ValueError):
+        prev_status = None
+
+    if prev_status == status:
+        return  # no change: no log line, no SD write
+
+    if prev_status is not None and status == 'online':
+        start = datetime.datetime.fromtimestamp(prev_since).strftime('%Y-%m-%d %H:%M:%S')
+        end = datetime.datetime.fromtimestamp(now).strftime('%H:%M:%S')
+        logging.warning(f"Back online after {_fmt_duration(now - prev_since)} "
+                        f"completely offline ({start} -> {end}).")
+    elif prev_status is not None:
+        logging.warning("Went completely offline (no internet on any uplink).")
+
+    try:
+        with open(NET_STATE_FILE, 'w') as f:
+            f.write(f"{status} {now}")
+    except OSError as e:
+        logging.error(f"Could not write net-state file: {e}")
+
+def run_once():
     # Check if actually associated with the MEO-WiFi SSID (not just "some" internet)
     if not is_connected():
         # If MEO login failed recently and the fallback still has internet, stay
         # put rather than thrashing back to MEO every run.
         if meo_in_backoff() and check_internet_connection():
-            logging.info("In MEO-WiFi back-off window and already online; staying on the fallback.")
+            logging.debug("In MEO-WiFi back-off window and already online; staying on the fallback.")
             ensure_hotspot()
             return
 
@@ -549,7 +607,7 @@ def main():
     disconnect_other_networks()
 
     if check_internet_connection():
-        logging.info("Connected to the internet. Nothing to do!")
+        logging.debug("Connected to the internet. Nothing to do!")
         clear_meo_backoff()
     else:
         logging.info("Connected to the network but no internet. Logging in to MEO-WiFi...")
@@ -564,6 +622,14 @@ def main():
             set_meo_backoff()
 
     ensure_hotspot()
+
+def main():
+    # Always record the offline/online window, even if run_once() raised, so a
+    # crash mid-run still gets bracketed as downtime rather than silently lost.
+    try:
+        run_once()
+    finally:
+        record_net_status()
 
 if __name__ == "__main__":
     main()
